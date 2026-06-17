@@ -9,6 +9,15 @@ PORT = int(os.environ.get('PORT', '10000'))
 MAX_UPLOAD = 300 * 1024 * 1024   # 300 MB para /clean e /meta
 JOB_TTL    = 600                  # 10 min para baixar os arquivos do job
 
+# Cookies do Instagram (login). Guarda no disco persistente do Render (/var/data)
+# se existir, para sobreviver a restart/deploy; senao usa pasta temporaria.
+COOKIE_DIR = '/var/data' if os.path.isdir('/var/data') else tempfile.gettempdir()
+COOKIES    = os.path.join(COOKIE_DIR, 'cookies.txt')
+
+def cookie_args():
+    """Usa o arquivo de cookies se existir (necessario p/ foto/carrossel do Instagram)."""
+    return ['--cookies', COOKIES] if os.path.exists(COOKIES) else []
+
 IMG_CLEAN = {'.jpg', '.jpeg', '.png', '.webp', '.avif', '.heic', '.tiff', '.tif'}
 VID_CLEAN = {'.mp4', '.mov', '.m4v', '.avi', '.mkv', '.webm'}
 GIF_RE    = re.compile(r'\.(gif)(\?|$)', re.I)
@@ -103,7 +112,7 @@ def detect_source(link):
 def _ytdlp_run(extra_args, link, out_dir, out_tmpl, emit):
     cmd = (['yt-dlp', '-P', out_dir, '-o', out_tmpl, '--newline',
             '--progress-template', 'download:DLP|%(progress._percent_str)s|%(progress.eta)s']
-           + extra_args + [link])
+           + cookie_args() + extra_args + [link])
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True, bufsize=1)
     last = ''
@@ -128,7 +137,7 @@ def _ytdlp_run(extra_args, link, out_dir, out_tmpl, emit):
 
 def _gallery_run(link, out_dir, emit):
     emit({'type': 'status', 'text': 'baixando imagem...'})
-    cmd = ['gallery-dl', '-d', out_dir, '--filename', '{num}.{extension}', link]
+    cmd = ['gallery-dl'] + cookie_args() + ['-d', out_dir, '--filename', '{num}.{extension}', link]
     p = subprocess.run(cmd, capture_output=True, text=True)
     emit({'type': 'progress', 'percent': 95})
     return p.returncode, p.stderr
@@ -250,6 +259,25 @@ class H(BaseHTTPRequestHandler):
             self.send_header('Content-Length', str(len(b))); self.end_headers(); self.wfile.write(b)
             return
 
+        if self.path.startswith('/cookie-status'):
+            has_file = os.path.exists(COOKIES)
+            count = 0
+            has_session = False
+            if has_file:
+                try:
+                    with open(COOKIES, 'r', encoding='utf-8', errors='replace') as f:
+                        content = f.read()
+                    count = sum(1 for l in content.splitlines() if l.strip() and not l.startswith('#'))
+                    has_session = 'sessionid' in content
+                except Exception:
+                    pass
+            b = json.dumps({'ok': True, 'has_file': has_file,
+                            'has_session': has_session, 'count': count}).encode('utf-8')
+            self.send_response(200); self._cors()
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(b))); self.end_headers(); self.wfile.write(b)
+            return
+
         # /file/{job_id}/{filename}
         m = re.match(r'^/file/([^/]+)/(.+)$', self.path)
         if m:
@@ -293,6 +321,27 @@ class H(BaseHTTPRequestHandler):
         return tmp, src
 
     def do_POST(self):
+        if self.path.startswith('/cookie-save'):
+            ln = int(self.headers.get('Content-Length', 0))
+            if ln > 10 * 1024 * 1024:
+                self._err(413, 'Arquivo muito grande.'); return
+            data = self.rfile.read(ln)
+            text = data.decode('utf-8', errors='replace')
+            if 'sessionid' not in text:
+                b = json.dumps({'ok': False, 'msg': 'Cookie sessionid não encontrado — verifique se você está logado no Instagram ao exportar.'}).encode('utf-8')
+            else:
+                try:
+                    os.makedirs(os.path.dirname(COOKIES), exist_ok=True)
+                except Exception:
+                    pass
+                with open(COOKIES, 'wb') as f:
+                    f.write(data)
+                count = sum(1 for l in text.splitlines() if l.strip() and not l.startswith('#'))
+                b = json.dumps({'ok': True, 'count': count}).encode('utf-8')
+            self.send_response(200); self._cors()
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(b))); self.end_headers(); self.wfile.write(b)
+            return
         if self.path.startswith('/meta'):
             self._meta(); return
         if self.path.startswith('/clean'):

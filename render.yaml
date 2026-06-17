@@ -2,7 +2,11 @@ services:
   - type: web
     name: aclick-baixador-motor
     runtime: docker
-    plan: free
+    plan: starter
     dockerfilePath: ./Dockerfile
     healthCheckPath: /ping
     autoDeploy: true
+    disk:
+      name: data
+      mountPath: /var/data
+      sizeGB: 1
