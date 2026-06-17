@@ -109,10 +109,9 @@ def detect_source(link):
     return 'Web'
 
 # ---------- download ----------
-def _ytdlp_run(extra_args, link, out_dir, out_tmpl, emit, proxy=''):
+def _ytdlp_run(extra_args, link, out_dir, out_tmpl, emit):
     cmd = (['yt-dlp', '-P', out_dir, '-o', out_tmpl, '--newline',
             '--progress-template', 'download:DLP|%(progress._percent_str)s|%(progress.eta)s']
-           + (['--proxy', proxy] if proxy else [])
            + cookie_args() + extra_args + [link])
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True, bufsize=1)
@@ -136,10 +135,9 @@ def _ytdlp_run(extra_args, link, out_dir, out_tmpl, emit, proxy=''):
     emit({'type': 'progress', 'percent': 95})
     return p.returncode, last
 
-def _gallery_run(link, out_dir, emit, proxy=''):
+def _gallery_run(link, out_dir, emit):
     emit({'type': 'status', 'text': 'baixando imagem...'})
-    cmd = (['gallery-dl'] + (['--proxy', proxy] if proxy else [])
-           + cookie_args() + ['-d', out_dir, '--filename', '{num}.{extension}', link])
+    cmd = ['gallery-dl'] + cookie_args() + ['-d', out_dir, '--filename', '{num}.{extension}', link]
     p = subprocess.run(cmd, capture_output=True, text=True)
     emit({'type': 'progress', 'percent': 95})
     return p.returncode, p.stderr
@@ -174,7 +172,7 @@ def _ensure_quicktime(path, emit):
     except Exception:
         pass
 
-def handle_one(link, emit, mode='av', limpar=False, job_id=None, proxy=''):
+def handle_one(link, emit, mode='av', limpar=False, job_id=None):
     link = normalize_link(link)
     src  = detect_source(link)
     clean_link = link.split('?')[0] if src == 'Instagram' else link
@@ -193,10 +191,10 @@ def handle_one(link, emit, mode='av', limpar=False, job_id=None, proxy=''):
             # TODOS os itens do post. O yt-dlp sozinho so traz o video e ignora as
             # fotos, por isso aqui ele e so o plano B (ex.: reel de video puro).
             emit({'type': 'kind', 'kind': 'Instagram (carrossel)'})
-            rc, err = _gallery_run(clean_link, tmp, emit, proxy=proxy)
+            rc, err = _gallery_run(clean_link, tmp, emit)
             if not collect(tmp):
                 emit({'type': 'kind', 'kind': 'Vídeo + áudio (MP4)'})
-                rc, err = _ytdlp_run(VIDEO_AV, clean_link, tmp, '%(autonumber)d.%(ext)s', emit, proxy=proxy)
+                rc, err = _ytdlp_run(VIDEO_AV, clean_link, tmp, '%(autonumber)d.%(ext)s', emit)
             for f in os.listdir(tmp):
                 if f.endswith('.mp4'):
                     _ensure_quicktime(os.path.join(tmp, f), emit)
@@ -372,9 +370,6 @@ class H(BaseHTTPRequestHandler):
         if mode not in ('av', 'video_only', 'audio_only', 'separate_zip'):
             mode = 'av'
         limpar = bool(data.get('clean'))
-        # Proxy (so para Instagram): vem do corpo do pedido (teste) ou da variavel
-        # de ambiente IG_PROXY no Render (producao). Ex.: socks5h://user:pass@host:port
-        proxy = (data.get('proxy') or os.environ.get('IG_PROXY') or '').strip()
 
         self.send_response(200); self._cors()
         self.send_header('Content-Type', 'application/x-ndjson; charset=utf-8')
@@ -400,7 +395,7 @@ class H(BaseHTTPRequestHandler):
 
         emit({'type': 'init', 'total': len(links)})
         for i, link in enumerate(links):
-            handle_one(link, lambda o, i=i: emit(o, i), mode=mode, limpar=limpar, job_id=job_id, proxy=proxy)
+            handle_one(link, lambda o, i=i: emit(o, i), mode=mode, limpar=limpar, job_id=job_id)
         emit({'type': 'all_done'})
 
     def _clean(self):
