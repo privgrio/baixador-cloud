@@ -192,7 +192,6 @@ def handle_one(link, emit, mode='av', limpar=False, job_id=None):
             # fotos, por isso aqui ele e so o plano B (ex.: reel de video puro).
             emit({'type': 'kind', 'kind': 'Instagram (carrossel)'})
             rc, err = _gallery_run(clean_link, tmp, emit)
-            emit({'type': 'status', 'text': 'DBG gdl rc=' + str(rc) + ' files=' + str(len(collect(tmp))) + ' err=' + (err or '')[-400:]})
             if not collect(tmp):
                 emit({'type': 'kind', 'kind': 'Vídeo + áudio (MP4)'})
                 rc, err = _ytdlp_run(VIDEO_AV, clean_link, tmp, '%(autonumber)d.%(ext)s', emit)
