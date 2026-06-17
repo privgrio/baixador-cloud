@@ -186,6 +186,18 @@ def handle_one(link, emit, mode='av', limpar=False, job_id=None):
         elif IMG_RE.search(link):
             emit({'type': 'kind', 'kind': 'Imagem'})
             _curl_run(clean_link, tmp, emit=emit)
+        elif src == 'Instagram' and mode != 'audio_only':
+            # Carrossel do Instagram (fotos + videos juntos): o gallery-dl pega
+            # TODOS os itens do post. O yt-dlp sozinho so traz o video e ignora as
+            # fotos, por isso aqui ele e so o plano B (ex.: reel de video puro).
+            emit({'type': 'kind', 'kind': 'Instagram (carrossel)'})
+            rc, err = _gallery_run(clean_link, tmp, emit)
+            if not collect(tmp):
+                emit({'type': 'kind', 'kind': 'Vídeo + áudio (MP4)'})
+                rc, err = _ytdlp_run(VIDEO_AV, clean_link, tmp, '%(autonumber)d.%(ext)s', emit)
+            for f in os.listdir(tmp):
+                if f.endswith('.mp4'):
+                    _ensure_quicktime(os.path.join(tmp, f), emit)
         else:
             emit({'type': 'kind', 'kind': 'Vídeo + áudio (MP4)'})
             if mode == 'audio_only':
