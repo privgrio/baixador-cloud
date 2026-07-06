@@ -17,7 +17,9 @@
   var title = meta('meta[property="og:title"]') || meta('meta[name="twitter:title"]');
   if (!title) { var h1 = document.querySelector('h1'); title = h1 ? h1.textContent : ''; }
   if (!title) title = document.title || 'produto';
-  title = title.replace(/\s*[|–—\-]\s*[^|–—\-]*$/, '').trim().slice(0, 80) || 'produto';
+  // tira so o sufixo do tipo " | Loja" / " - Loja" (exige espaco dos dois lados do separador,
+  // pra nao cortar hifen interno como em "Non-Stick"). u2013/u2014 sao os tracos longos.
+  title = title.replace(new RegExp('\\s+[|\\u2013\\u2014-]\\s+[^|\\u2013\\u2014-]*$'), '').trim().slice(0, 80) || 'produto';
 
   // ---------- coleta de fotos ----------
   var BAD = /(logo|sprite|\bicon|placeholder|swatch|payment|social|pixel|1x1|blank|spacer|badge|avatar|spinner|loading|thumbnail|-thumb|thumb-|instagram|facebook|pinterest|tiktok|youtube)/i;
@@ -51,13 +53,15 @@
     return u;
   }
   function biggestSrcset(ss) {
-    // entende descritores de largura ('800w') E de densidade ('2x'); pega o maior
+    // entende '800w' e '2x'. Separa candidatos por virgula SEGUIDA de espaco, pra nao
+    // quebrar URLs que tem virgula no meio (ex: Cloudinary .../w_800,h_600/...).
     var best = '', bw = -1;
-    ss.split(',').forEach(function (part) {
+    ss.split(/,\s+/).forEach(function (part) {
       part = part.trim(); if (!part) return;
       var seg = part.split(/\s+/), url = seg[0], d = seg[1] || '';
+      if (!url) return;
       var mw = d.match(/^([\d.]+)w$/), mx = d.match(/^([\d.]+)x$/);
-      var score = mw ? parseFloat(mw[1]) : (mx ? parseFloat(mx[1]) * 1000 : 0);
+      var score = mw ? parseFloat(mw[1]) : (mx ? parseFloat(mx[1]) * 1000 : 1);
       if (score > bw) { bw = score; best = url; }
     });
     return best;
@@ -111,7 +115,9 @@
     (inGallery(img) ? gal : big).push(u);
   }
   Array.prototype.forEach.call(document.images, function (img) {
-    var u = (img.srcset && biggestSrcset(img.srcset)) || img.currentSrc || img.src;
+    var b = img.srcset ? biggestSrcset(img.srcset) : '';
+    if (b && !/^(https?:)?\/\//i.test(b)) b = '';   // resultado estranho/relativo: usa o src resolvido
+    var u = b || img.currentSrc || img.src;
     var w = img.naturalWidth || img.width || 0;
     if (u && (img.srcset || w >= 500)) pushImg(u, img);
   });

@@ -181,15 +181,18 @@ SHOP_UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
            '(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36')
 
 
-class _ShopNoRedirect(urllib.request.HTTPRedirectHandler):
-    """Bloqueia redirecionamento: sem isso um site publico poderia redirecionar
-    para um host interno (169.254.x, 127.0.0.1) e furar a trava de SSRF."""
-    def http_error_301(self, req, fp, code, msg, headers):
-        raise ValueError('redirect bloqueado')
-    http_error_302 = http_error_303 = http_error_307 = http_error_308 = http_error_301
+class _ShopSafeRedirect(urllib.request.HTTPRedirectHandler):
+    """Segue redirect SO se o destino for host publico. Deixa lojas Shopify que
+    redirecionam para o dominio canonico funcionarem, mas bloqueia redirect para
+    host interno (169.254.x, 127.0.0.1) — protege contra SSRF."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _shop_url_ok(newurl):
+            raise ValueError('redirect para host nao permitido')
+        return urllib.request.HTTPRedirectHandler.redirect_request(
+            self, req, fp, code, msg, headers, newurl)
 
 
-_SHOP_OPENER = urllib.request.build_opener(_ShopNoRedirect)
+_SHOP_OPENER = urllib.request.build_opener(_ShopSafeRedirect)
 
 
 def _shop_json(url, timeout=12):
@@ -200,7 +203,7 @@ def _shop_json(url, timeout=12):
         with _SHOP_OPENER.open(req, timeout=timeout) as r:
             if getattr(r, 'status', 200) != 200:
                 return None
-            data = r.read(8 * 1024 * 1024)   # JSON de produto/colecao nao passa disso
+            data = r.read(64 * 1024 * 1024)   # colecao de 250 produtos pode ser grande; teto generoso
         return json.loads(data)
     except Exception:
         return None
@@ -321,8 +324,7 @@ def _shop_url_ok(url):
             return False
         for info in socket.getaddrinfo(p.hostname, None):
             ip = ipaddress.ip_address(info[4][0])
-            if (ip.is_private or ip.is_loopback or ip.is_link_local or
-                    ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            if not ip.is_global:   # so IP publico (bloqueia privado/loopback/link-local/reservado/CGNAT 100.64)
                 return False
         return True
     except Exception:
@@ -379,16 +381,21 @@ def _shop_download_all(produtos, emit, referer, limpar=True):
         for u in prod['videos']:
             tasks.append((folder, n, u, True)); n += 1
     total = len(tasks)
-    state = {'n': 0, 'ok': 0}
+    state = {'n': 0, 'ok': 0, 'bytes': 0}
+    cap = 3 * 1024 * 1024 * 1024   # teto total por lote (anti-abuso / disco da nuvem)
     lock = threading.Lock()
 
     def work_one(t):
         folder, num, url, is_vid = t
+        with lock:
+            if state['bytes'] > cap:   # ja atingiu o teto total do lote: para de baixar
+                state['n'] += 1
+                return
         ext = 'mp4' if is_vid else shop_pick_ext(url)
         out = os.path.join(folder, str(num) + '.' + ext)
-        ok = False
+        ok, sz = False, 0
         try:
-            shop_download(url, out, referer=referer)
+            sz = shop_download(url, out, referer=referer)
             if limpar:
                 clean_meta(out)
             ok = True
@@ -396,6 +403,7 @@ def _shop_download_all(produtos, emit, referer, limpar=True):
             pass
         with lock:
             state['n'] += 1
+            state['bytes'] += sz
             if ok:
                 state['ok'] += 1
             pct = int(state['n'] / max(total, 1) * 100)
@@ -423,28 +431,37 @@ def handle_shopify_cloud(link, produtos, emit, job_dir, job_id, limpar=True):
     emit({'type': 'start', 'link': link, 'source': 'Shopify'})
     emit({'type': 'kind', 'kind': 'Shopify · ' + str(total_prod) + ' produto(s)'})
     work, okc, _ = _shop_download_all(produtos, emit, referer=link, limpar=limpar)
-    if not okc:
+    try:
+        if not okc:
+            emit({'type': 'done', 'ok': False, 'msg': 'nao consegui baixar as fotos deste link.'})
+            return
+        p = urllib.parse.urlparse(link)
+        m = re.search(r'/collections/([^/?#]+)', p.path or '')
+        if total_prod == 1:
+            zipbase = shop_sanitize(produtos[0]['title'])
+        else:
+            zipbase = shop_sanitize(m.group(1) if m else 'produtos')
+        # nome do ZIP so em ASCII: o endpoint /file usa header latin-1 e travaria com emoji/acento
+        zipbase = re.sub(r'[^A-Za-z0-9 ._-]', '_', zipbase).strip() or 'produtos'
+        # download longo pode passar do TTL do job: renova e garante a pasta antes de gravar
+        with _jobs_lock:
+            j = _jobs.get(job_id)
+            if j:
+                j['expires'] = time.time() + JOB_TTL
+            else:
+                _jobs[job_id] = {'dir': job_dir, 'files': [], 'expires': time.time() + JOB_TTL}
+        os.makedirs(job_dir, exist_ok=True)
+        emit({'type': 'status', 'text': 'compactando em ZIP...'})
+        zip_path = os.path.join(job_dir, zipbase + '.zip')
+        k = 2
+        while os.path.exists(zip_path):   # nao sobrescrever ZIP de outro link do mesmo lote
+            zip_path = os.path.join(job_dir, zipbase + ' (' + str(k) + ').zip'); k += 1
+        _shop_make_zip(work, zip_path)
+        _job_add_file(job_id, zip_path)
+        emit({'type': 'done', 'ok': True, 'saved': [os.path.basename(zip_path)],
+              'job_id': job_id})
+    finally:
         shutil.rmtree(work, ignore_errors=True)
-        emit({'type': 'done', 'ok': False, 'msg': 'nao consegui baixar as fotos deste link.'})
-        return
-    p = urllib.parse.urlparse(link)
-    m = re.search(r'/collections/([^/?#]+)', p.path or '')
-    if total_prod == 1:
-        zipbase = shop_sanitize(produtos[0]['title'])
-    else:
-        zipbase = shop_sanitize(m.group(1) if m else 'produtos')
-    # nome do ZIP so em ASCII: o endpoint /file usa header latin-1 e travaria com emoji/acento
-    zipbase = re.sub(r'[^A-Za-z0-9 ._-]', '_', zipbase).strip() or 'produtos'
-    emit({'type': 'status', 'text': 'compactando em ZIP...'})
-    zip_path = os.path.join(job_dir, zipbase + '.zip')
-    k = 2
-    while os.path.exists(zip_path):   # nao sobrescrever ZIP de outro link do mesmo lote
-        zip_path = os.path.join(job_dir, zipbase + ' (' + str(k) + ').zip'); k += 1
-    _shop_make_zip(work, zip_path)
-    shutil.rmtree(work, ignore_errors=True)
-    _job_add_file(job_id, zip_path)
-    emit({'type': 'done', 'ok': True, 'saved': [os.path.basename(zip_path)],
-          'job_id': job_id})
 
 
 def handle_one(link, emit, mode='av', limpar=False, job_id=None):
@@ -685,15 +702,21 @@ class H(BaseHTTPRequestHandler):
 
         emit({'type': 'init', 'total': len(links)})
         for i, link in enumerate(links):
-            # Loja Shopify (produto/colecao): baixa por produto e entrega um ZIP.
-            # So desvia se realmente encontrou foto/video; senao segue o fluxo normal.
-            prods = shopify_expand(normalize_link(link), want_video=True)
-            has_media = prods and any(p['images'] or p['videos'] for p in prods)
-            if has_media:
-                handle_shopify_cloud(normalize_link(link), prods, lambda o, i=i: emit(o, i),
-                                     d, job_id, limpar=True)
-            else:
-                handle_one(link, lambda o, i=i: emit(o, i), mode=mode, limpar=limpar, job_id=job_id)
+            emit_i = lambda o, i=i: emit(o, i)
+            try:
+                # Loja Shopify (produto/colecao): baixa por produto e entrega um ZIP.
+                # So desvia se realmente encontrou foto/video; senao segue o fluxo normal.
+                prods = shopify_expand(normalize_link(link), want_video=True)
+                has_media = prods and any(p['images'] or p['videos'] for p in prods)
+                if has_media:
+                    handle_shopify_cloud(normalize_link(link), prods, emit_i, d, job_id, limpar=True)
+                else:
+                    handle_one(link, emit_i, mode=mode, limpar=limpar, job_id=job_id)
+            except Exception as ex:   # um link com erro nao derruba o lote inteiro
+                try:
+                    emit_i({'type': 'done', 'ok': False, 'msg': str(ex)[:200]})
+                except Exception:
+                    pass
         emit({'type': 'all_done'})
 
     def _produto(self):
