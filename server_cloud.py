@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # Motor de NUVEM do Baixador — download + limpar + ver metadados
 # Roda no Render via Docker. HTTP simples (Render termina HTTPS na frente).
-import os, re, json, shutil, tempfile, subprocess, urllib.parse, threading, time, uuid, zipfile
+import os, re, json, shutil, tempfile, subprocess, urllib.parse, urllib.request, threading, time, uuid, zipfile, base64, socket, ipaddress
+import concurrent.futures
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import limpa_midia
 
@@ -172,6 +173,280 @@ def _ensure_quicktime(path, emit):
     except Exception:
         pass
 
+# ============================================================================
+# SHOPIFY: cola link de produto/colecao -> baixa TODAS as fotos (e videos) por
+# produto e entrega um ZIP (pasta por produto dentro). Funciona em qualquer loja.
+# ============================================================================
+SHOP_UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
+           '(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36')
+
+
+class _ShopNoRedirect(urllib.request.HTTPRedirectHandler):
+    """Bloqueia redirecionamento: sem isso um site publico poderia redirecionar
+    para um host interno (169.254.x, 127.0.0.1) e furar a trava de SSRF."""
+    def http_error_301(self, req, fp, code, msg, headers):
+        raise ValueError('redirect bloqueado')
+    http_error_302 = http_error_303 = http_error_307 = http_error_308 = http_error_301
+
+
+_SHOP_OPENER = urllib.request.build_opener(_ShopNoRedirect)
+
+
+def _shop_json(url, timeout=12):
+    if not _shop_url_ok(url):   # bloqueia deteccao apontada para host interno (SSRF)
+        return None
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': SHOP_UA, 'Accept': 'application/json'})
+        with _SHOP_OPENER.open(req, timeout=timeout) as r:
+            if getattr(r, 'status', 200) != 200:
+                return None
+            data = r.read(8 * 1024 * 1024)   # JSON de produto/colecao nao passa disso
+        return json.loads(data)
+    except Exception:
+        return None
+
+
+def _shop_abs(u):
+    u = (u or '').strip()
+    return ('https:' + u) if u.startswith('//') else u
+
+
+def shop_sanitize(name):
+    name = (name or '').strip()
+    name = re.sub(r'[\\/:*?"<>|\n\r\t]+', ' ', name)
+    name = re.sub(r'\s+', ' ', name).strip().strip('.')
+    return name[:80] or 'produto'
+
+
+def _shop_videos(handle, host):
+    vids = []
+    js = _shop_json(host + '/products/' + handle + '.js')
+    for m in (js or {}).get('media', []) or []:
+        if m.get('media_type') == 'video':
+            best, bh = None, -1
+            for s in (m.get('sources') or []):
+                tag = (str(s.get('mime_type', '')) + ' ' + str(s.get('format', ''))).lower()
+                if 'mp4' in tag:
+                    h = s.get('height') or 0
+                    if h > bh:
+                        bh, best = h, s.get('url')
+            if not best and (m.get('sources')):
+                best = m['sources'][-1].get('url')
+            if best:
+                vids.append(_shop_abs(best))
+    return vids
+
+
+def _shop_product(prod):
+    title = prod.get('title') or prod.get('handle') or 'produto'
+    handle = prod.get('handle') or ''
+    images = []
+    for im in prod.get('images', []) or []:
+        s = im.get('src') if isinstance(im, dict) else im
+        if s:
+            images.append(_shop_abs(s))
+    return {'title': title, 'handle': handle, 'images': images, 'videos': []}
+
+
+def _shop_fill_videos(produtos, host):
+    def fill(p):
+        if p.get('handle'):
+            try:
+                p['videos'] = _shop_videos(p['handle'], host)
+            except Exception:
+                pass
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(fill, produtos))
+    except Exception:
+        for p in produtos:
+            fill(p)
+
+
+def shopify_expand(link, want_video=False):
+    """Link Shopify (produto ou colecao) -> [{title,handle,images,videos}] ou None."""
+    try:
+        p = urllib.parse.urlparse(link)
+        if not p.netloc:
+            return None
+        host = (p.scheme or 'https') + '://' + p.netloc
+        path = p.path or ''
+        m = re.search(r'/products/([^/?#]+)', path)
+        if m:
+            data = _shop_json(host + '/products/' + m.group(1) + '.json')
+            if isinstance(data, dict) and data.get('product'):
+                prods = [_shop_product(data['product'])]
+                if want_video:
+                    _shop_fill_videos(prods, host)
+                return prods
+            return None
+        m = re.search(r'/collections/([^/?#]+)', path)
+        if m:
+            col = m.group(1)
+            produtos, page = [], 1
+            while page <= 40 and len(produtos) < 500:   # teto de seguranca de produtos por lote
+                data = _shop_json(host + '/collections/' + col + '/products.json?limit=250&page=' + str(page))
+                items = (data or {}).get('products') if isinstance(data, dict) else None
+                if not items:
+                    break
+                for prod in items:
+                    produtos.append(_shop_product(prod))
+                if len(items) < 250:
+                    break
+                page += 1
+            produtos = produtos[:500]
+            # Buscar video exige 1 requisicao por produto; so vale em colecoes
+            # pequenas, senao trava colecoes gigantes dentro de um unico request.
+            if produtos and want_video and len(produtos) <= 30:
+                _shop_fill_videos(produtos, host)
+            return produtos or None
+    except Exception:
+        return None
+    return None
+
+
+def shop_pick_ext(url):
+    tail = urllib.parse.urlparse(url).path.rsplit('/', 1)[-1]
+    m = re.search(r'\.([a-zA-Z0-9]{2,5})$', tail)
+    ext = (m.group(1).lower() if m else 'jpg')
+    return 'jpg' if ext == 'jpeg' else ext
+
+
+def _shop_url_ok(url):
+    """So permite http/https apontando para host publico. Barra file://, IP interno,
+    loopback e o endpoint de metadados da nuvem (protege contra SSRF no /produto)."""
+    try:
+        p = urllib.parse.urlparse(url)
+        if p.scheme not in ('http', 'https') or not p.hostname:
+            return False
+        for info in socket.getaddrinfo(p.hostname, None):
+            ip = ipaddress.ip_address(info[4][0])
+            if (ip.is_private or ip.is_loopback or ip.is_link_local or
+                    ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def shop_download(url, dest_path, referer=None, timeout=60, max_bytes=300 * 1024 * 1024):
+    if not _shop_url_ok(url):
+        raise ValueError('url nao permitida')
+    headers = {'User-Agent': SHOP_UA,
+               'Accept': 'image/avif,image/webp,image/*,video/*,*/*;q=0.8'}
+    if referer:
+        headers['Referer'] = referer
+    req = urllib.request.Request(url, headers=headers)
+    total = 0
+    try:
+        with _SHOP_OPENER.open(req, timeout=timeout) as r, open(dest_path, 'wb') as f:
+            while True:
+                chunk = r.read(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError('arquivo muito grande')
+                f.write(chunk)
+        if total < 100:
+            raise ValueError('conteudo vazio')
+        return total
+    except Exception:
+        try:
+            if os.path.exists(dest_path):
+                os.remove(dest_path)   # nunca deixa arquivo parcial/corrompido no ZIP/pasta
+        except OSError:
+            pass
+        raise
+
+
+def _shop_download_all(produtos, emit, referer, limpar=True):
+    """Baixa todos os produtos numa pasta temp (uma subpasta por produto).
+    Retorna (work_dir, quantos_ok, total_prod)."""
+    work = tempfile.mkdtemp(prefix='shop_')
+    tasks, used = [], set()
+    for prod in produtos:
+        name = shop_sanitize(prod['title'])
+        base, k = name, 2
+        while name in used:
+            name = base + ' (' + str(k) + ')'; k += 1
+        used.add(name)
+        folder = os.path.join(work, name)
+        os.makedirs(folder, exist_ok=True)
+        n = 1
+        for u in prod['images']:
+            tasks.append((folder, n, u, False)); n += 1
+        for u in prod['videos']:
+            tasks.append((folder, n, u, True)); n += 1
+    total = len(tasks)
+    state = {'n': 0, 'ok': 0}
+    lock = threading.Lock()
+
+    def work_one(t):
+        folder, num, url, is_vid = t
+        ext = 'mp4' if is_vid else shop_pick_ext(url)
+        out = os.path.join(folder, str(num) + '.' + ext)
+        ok = False
+        try:
+            shop_download(url, out, referer=referer)
+            if limpar:
+                clean_meta(out)
+            ok = True
+        except Exception:
+            pass
+        with lock:
+            state['n'] += 1
+            if ok:
+                state['ok'] += 1
+            pct = int(state['n'] / max(total, 1) * 100)
+        if emit:
+            emit({'type': 'progress', 'percent': pct})
+
+    if total:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(work_one, tasks))
+    return work, state['ok'], len(produtos)
+
+
+def _shop_make_zip(work, zip_path):
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as z:
+        for root, _, files in os.walk(work):
+            for f in sorted(files):
+                full = os.path.join(root, f)
+                rel = os.path.relpath(full, work)
+                z.write(full, rel)
+
+
+def handle_shopify_cloud(link, produtos, emit, job_dir, job_id, limpar=True):
+    """Baixa os produtos e entrega um ZIP (pasta por produto) via o job atual."""
+    total_prod = len(produtos)
+    emit({'type': 'start', 'link': link, 'source': 'Shopify'})
+    emit({'type': 'kind', 'kind': 'Shopify · ' + str(total_prod) + ' produto(s)'})
+    work, okc, _ = _shop_download_all(produtos, emit, referer=link, limpar=limpar)
+    if not okc:
+        shutil.rmtree(work, ignore_errors=True)
+        emit({'type': 'done', 'ok': False, 'msg': 'nao consegui baixar as fotos deste link.'})
+        return
+    p = urllib.parse.urlparse(link)
+    m = re.search(r'/collections/([^/?#]+)', p.path or '')
+    if total_prod == 1:
+        zipbase = shop_sanitize(produtos[0]['title'])
+    else:
+        zipbase = shop_sanitize(m.group(1) if m else 'produtos')
+    # nome do ZIP so em ASCII: o endpoint /file usa header latin-1 e travaria com emoji/acento
+    zipbase = re.sub(r'[^A-Za-z0-9 ._-]', '_', zipbase).strip() or 'produtos'
+    emit({'type': 'status', 'text': 'compactando em ZIP...'})
+    zip_path = os.path.join(job_dir, zipbase + '.zip')
+    k = 2
+    while os.path.exists(zip_path):   # nao sobrescrever ZIP de outro link do mesmo lote
+        zip_path = os.path.join(job_dir, zipbase + ' (' + str(k) + ').zip'); k += 1
+    _shop_make_zip(work, zip_path)
+    shutil.rmtree(work, ignore_errors=True)
+    _job_add_file(job_id, zip_path)
+    emit({'type': 'done', 'ok': True, 'saved': [os.path.basename(zip_path)],
+          'job_id': job_id})
+
+
 def handle_one(link, emit, mode='av', limpar=False, job_id=None):
     link = normalize_link(link)
     src  = detect_source(link)
@@ -271,6 +546,19 @@ class H(BaseHTTPRequestHandler):
             self.send_header('Content-Length', str(len(b))); self.end_headers(); self.wfile.write(b)
             return
 
+        if self.path.startswith('/bookmarklet'):
+            # pagina que instala o "botao magico" (bookmarklet)
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bookmarklet.html')
+            try:
+                with open(path, 'rb') as f:
+                    b = f.read()
+            except Exception:
+                self.send_error(404); return
+            self.send_response(200); self._cors()
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(b))); self.end_headers(); self.wfile.write(b)
+            return
+
         if self.path.startswith('/cookie-status'):
             has_file = os.path.exists(COOKIES)
             count = 0
@@ -358,6 +646,8 @@ class H(BaseHTTPRequestHandler):
             self._meta(); return
         if self.path.startswith('/clean'):
             self._clean(); return
+        if self.path.startswith('/produto'):
+            self._produto(); return
         if self.path == '/download':
             self._download(); return
         self.send_error(404)
@@ -395,8 +685,103 @@ class H(BaseHTTPRequestHandler):
 
         emit({'type': 'init', 'total': len(links)})
         for i, link in enumerate(links):
-            handle_one(link, lambda o, i=i: emit(o, i), mode=mode, limpar=limpar, job_id=job_id)
+            # Loja Shopify (produto/colecao): baixa por produto e entrega um ZIP.
+            # So desvia se realmente encontrou foto/video; senao segue o fluxo normal.
+            prods = shopify_expand(normalize_link(link), want_video=True)
+            has_media = prods and any(p['images'] or p['videos'] for p in prods)
+            if has_media:
+                handle_shopify_cloud(normalize_link(link), prods, lambda o, i=i: emit(o, i),
+                                     d, job_id, limpar=True)
+            else:
+                handle_one(link, lambda o, i=i: emit(o, i), mode=mode, limpar=limpar, job_id=job_id)
         emit({'type': 'all_done'})
+
+    def _produto(self):
+        """Botao magico (bookmarklet): recebe {title, images, videos, page_url},
+        baixa tudo, limpa metadados e devolve um ZIP direto para download."""
+        try:
+            ln = int(self.headers.get('Content-Length') or 0)
+        except (TypeError, ValueError):
+            ln = 0
+        if ln <= 0 or ln > 100 * 1024 * 1024:   # comporta varias fotos enviadas em base64
+            self._err(413, 'payload invalido'); return
+        raw = self.rfile.read(ln)
+        payload = None
+        try:
+            txt = raw.decode('utf-8', 'replace')
+            if txt.lstrip().startswith('{'):
+                payload = json.loads(txt)
+            else:
+                qs = urllib.parse.parse_qs(txt)
+                if 'payload' in qs:
+                    payload = json.loads(qs['payload'][0])
+        except Exception:
+            payload = None
+        if not isinstance(payload, dict):
+            self._err(400, 'payload invalido'); return
+        title = shop_sanitize(payload.get('title') or 'produto')
+        referer = payload.get('page_url') or None
+        images = [u for u in (payload.get('images') or []) if u]
+        videos = [u for u in (payload.get('videos') or []) if u]
+        blobs = payload.get('blobs') or []   # fotos ja baixadas pelo navegador (B5)
+        if len(images) + len(videos) + len(blobs) > 300:   # teto por pedido (anti-abuso)
+            self._err(413, 'itens demais nesta pagina.'); return
+        limpar = bool(payload.get('clean', True))
+        prod = {'title': title, 'handle': '', 'images': images, 'videos': videos}
+        work, okc, _ = _shop_download_all([prod], None, referer=referer, limpar=limpar)
+        # anexa as fotos enviadas em bytes (quando o servidor nao consegue baixar pela URL)
+        if blobs:
+            folder = os.path.join(work, shop_sanitize(title))
+            os.makedirs(folder, exist_ok=True)
+            n = 1   # continua do maior numero ja usado (nao sobrescreve fotos com falha no meio)
+            for _f in os.listdir(folder):
+                _m = re.match(r'(\d+)', _f)
+                if _m:
+                    n = max(n, int(_m.group(1)) + 1)
+            for bl in blobs:
+                try:
+                    raw = base64.b64decode(bl.get('b64') or '')
+                    if len(raw) < 512:
+                        continue
+                    nm = bl.get('name') or ''
+                    ext = shop_pick_ext(nm) if '.' in nm else 'jpg'
+                    out = os.path.join(folder, str(n) + '.' + ext)
+                    with open(out, 'wb') as f:
+                        f.write(raw)
+                    if limpar:
+                        clean_meta(out)
+                    okc += 1; n += 1
+                except Exception:
+                    pass
+        if not okc:
+            shutil.rmtree(work, ignore_errors=True)
+            self._err(502, 'nao consegui baixar as imagens desta pagina.'); return
+        fd, zip_path = tempfile.mkstemp(suffix='.zip')
+        os.close(fd)
+        try:
+            _shop_make_zip(work, zip_path)
+            size = os.path.getsize(zip_path)
+            # nome do arquivo: ASCII seguro no filename + versao UTF-8 (acento/emoji) no filename*
+            ascii_name = (re.sub(r'[^A-Za-z0-9 ._-]', '_', title).strip() or 'produto') + '.zip'
+            utf8_name = urllib.parse.quote(title + '.zip')
+            self.send_response(200); self._cors()
+            self.send_header('Content-Type', 'application/zip')
+            self.send_header('Content-Disposition',
+                             'attachment; filename="' + ascii_name + '"; filename*=UTF-8\'\'' + utf8_name)
+            self.send_header('Content-Length', str(size))
+            self.end_headers()
+            with open(zip_path, 'rb') as f:   # envia em pedacos (nao carrega o ZIP todo na memoria)
+                while True:
+                    c = f.read(65536)
+                    if not c:
+                        break
+                    self.wfile.write(c)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+            try:
+                os.remove(zip_path)
+            except Exception:
+                pass
 
     def _clean(self):
         tmp, src = self._recv()

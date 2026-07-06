@@ -4,5 +4,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir yt-dlp gallery-dl
 WORKDIR /app
-COPY server_cloud.py limpa_midia.py /app/
+COPY server_cloud.py limpa_midia.py bookmarklet.html /app/
 CMD ["python", "server_cloud.py"]
