@@ -50,8 +50,11 @@ def _checar_dependencia(nome: str) -> None:
         )
 
 
-def _run(cmd: list[str]) -> None:
-    r = subprocess.run(cmd, capture_output=True, text=True)
+def _run(cmd: list[str], timeout: int = 600) -> None:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"Tempo esgotado ({timeout}s): {' '.join(cmd)}")
     if r.returncode != 0:
         raise RuntimeError(f"Falhou: {' '.join(cmd)}\n{r.stderr.strip()}")
 
@@ -161,7 +164,6 @@ def limpar_video(
         18 ~ visualmente transparente em H.264). Áudio é copiado, não tocado.
         Atenção: reencodar repetidamente acumula perda — evite ciclos.
     """
-    _checar_dependencia("exiftool")
     _checar_dependencia("ffmpeg")
     src, dst = Path(src), Path(dst)
 
@@ -174,8 +176,13 @@ def limpar_video(
               "-c:v", vcodec, "-crf", str(crf), "-preset", preset,
               "-c:a", "copy", str(dst)])
 
-    # alguns metadados ficam em átomos que o -map_metadata não alcança
-    _run(["exiftool", "-all=", "-overwrite_original", str(dst)])
+    # Passada extra do exiftool para atomos teimosos SO em containers que ele sabe
+    # ESCREVER (mp4/mov/m4v). Em mkv/webm/avi o exiftool nao escreve e levantaria
+    # erro, jogando fora o video ja limpo pelo ffmpeg; nesses casos o ffmpeg
+    # (-map_metadata -1) ja removeu os metadados.
+    if dst.suffix.lower() in (".mp4", ".mov", ".m4v"):
+        _checar_dependencia("exiftool")
+        _run(["exiftool", "-all=", "-overwrite_original", str(dst)])
 
 
 # ---------------------------------------------------------------------------
