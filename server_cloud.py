@@ -15,9 +15,22 @@ JOB_TTL    = 600                  # 10 min para baixar os arquivos do job
 COOKIE_DIR = '/var/data' if os.path.isdir('/var/data') else tempfile.gettempdir()
 COOKIES    = os.path.join(COOKIE_DIR, 'cookies.txt')
 
-def cookie_args():
-    """Usa o arquivo de cookies se existir (necessario p/ foto/carrossel do Instagram)."""
-    return ['--cookies', COOKIES] if os.path.exists(COOKIES) else []
+def _cookie_path(user):
+    """Arquivo de cookies ISOLADO por usuario (chave imprevisivel vinda do front).
+    Sem chave, cai no arquivo legado compartilhado (compatibilidade)."""
+    u = re.sub(r'[^A-Za-z0-9]', '', str(user or ''))[:64]
+    return os.path.join(COOKIE_DIR, 'cookies_' + u + '.txt') if u else COOKIES
+
+def cookie_args(user=None):
+    """Usa o arquivo de cookies do usuario se existir (foto/carrossel do Instagram)."""
+    p = _cookie_path(user)
+    return ['--cookies', p] if os.path.exists(p) else []
+
+def _cd(name):
+    """Content-Disposition seguro: ASCII no filename + UTF-8 (acento/emoji) no filename*.
+    Evita UnicodeEncodeError (header latin-1) que derrubava a resposta com nome com emoji."""
+    ascii_name = re.sub(r'[^A-Za-z0-9 ._-]', '_', str(name)).strip() or 'arquivo'
+    return 'attachment; filename="' + ascii_name + '"; filename*=UTF-8\'\'' + urllib.parse.quote(str(name))
 
 IMG_CLEAN = {'.jpg', '.jpeg', '.png', '.webp', '.avif', '.heic', '.tiff', '.tif'}
 VID_CLEAN = {'.mp4', '.mov', '.m4v', '.avi', '.mkv', '.webm'}
@@ -110,10 +123,10 @@ def detect_source(link):
     return 'Web'
 
 # ---------- download ----------
-def _ytdlp_run(extra_args, link, out_dir, out_tmpl, emit):
+def _ytdlp_run(extra_args, link, out_dir, out_tmpl, emit, user=None):
     cmd = (['yt-dlp', '-P', out_dir, '-o', out_tmpl, '--newline',
             '--progress-template', 'download:DLP|%(progress._percent_str)s|%(progress.eta)s']
-           + cookie_args() + extra_args + [link])
+           + cookie_args(user) + extra_args + [link])
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True, bufsize=1)
     last = ''
@@ -136,9 +149,9 @@ def _ytdlp_run(extra_args, link, out_dir, out_tmpl, emit):
     emit({'type': 'progress', 'percent': 95})
     return p.returncode, last
 
-def _gallery_run(link, out_dir, emit):
+def _gallery_run(link, out_dir, emit, user=None):
     emit({'type': 'status', 'text': 'baixando imagem...'})
-    cmd = ['gallery-dl'] + cookie_args() + ['-d', out_dir, '--filename', '{num}.{extension}', link]
+    cmd = ['gallery-dl'] + cookie_args(user) + ['-d', out_dir, '--filename', '{num}.{extension}', link]
     p = subprocess.run(cmd, capture_output=True, text=True)
     emit({'type': 'progress', 'percent': 95})
     return p.returncode, p.stderr
@@ -464,7 +477,7 @@ def handle_shopify_cloud(link, produtos, emit, job_dir, job_id, limpar=True):
         shutil.rmtree(work, ignore_errors=True)
 
 
-def handle_one(link, emit, mode='av', limpar=False, job_id=None):
+def handle_one(link, emit, mode='av', limpar=False, job_id=None, user=None):
     link = normalize_link(link)
     src  = detect_source(link)
     clean_link = link.split('?')[0] if src == 'Instagram' else link
@@ -483,10 +496,10 @@ def handle_one(link, emit, mode='av', limpar=False, job_id=None):
             # TODOS os itens do post. O yt-dlp sozinho so traz o video e ignora as
             # fotos, por isso aqui ele e so o plano B (ex.: reel de video puro).
             emit({'type': 'kind', 'kind': 'Instagram (carrossel)'})
-            rc, err = _gallery_run(clean_link, tmp, emit)
+            rc, err = _gallery_run(clean_link, tmp, emit, user)
             if not collect(tmp):
                 emit({'type': 'kind', 'kind': 'Vídeo + áudio (MP4)'})
-                rc, err = _ytdlp_run(VIDEO_AV, clean_link, tmp, '%(autonumber)d.%(ext)s', emit)
+                rc, err = _ytdlp_run(VIDEO_AV, clean_link, tmp, '%(autonumber)d.%(ext)s', emit, user)
             for f in os.listdir(tmp):
                 if f.endswith('.mp4'):
                     _ensure_quicktime(os.path.join(tmp, f), emit)
@@ -495,16 +508,16 @@ def handle_one(link, emit, mode='av', limpar=False, job_id=None):
             if mode == 'audio_only':
                 emit({'type': 'kind', 'kind': 'Só áudio (MP3)'})
                 rc, err = _ytdlp_run(['-x', '--audio-format', 'mp3', '--audio-quality', '0'],
-                                     clean_link, tmp, '%(autonumber)d.%(ext)s', emit)
+                                     clean_link, tmp, '%(autonumber)d.%(ext)s', emit, user)
             else:
-                rc, err = _ytdlp_run(VIDEO_AV, clean_link, tmp, '%(autonumber)d.%(ext)s', emit)
+                rc, err = _ytdlp_run(VIDEO_AV, clean_link, tmp, '%(autonumber)d.%(ext)s', emit, user)
                 if rc == 0:
                     for f in os.listdir(tmp):
                         if f.endswith('.mp4'):
                             _ensure_quicktime(os.path.join(tmp, f), emit)
                 if rc != 0 and not collect(tmp):
                     emit({'type': 'kind', 'kind': 'Imagem'})
-                    _gallery_run(clean_link, tmp, emit)
+                    _gallery_run(clean_link, tmp, emit, user)
 
         files = collect(tmp)
         if limpar and files:
@@ -544,6 +557,7 @@ class H(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.send_header('Access-Control-Allow-Private-Network', 'true')
+        self.send_header('Access-Control-Expose-Headers', 'Content-Disposition')
 
     def do_OPTIONS(self):
         self.send_response(204); self._cors()
@@ -577,12 +591,14 @@ class H(BaseHTTPRequestHandler):
             return
 
         if self.path.startswith('/cookie-status'):
-            has_file = os.path.exists(COOKIES)
+            qs    = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            cpath = _cookie_path((qs.get('u') or [''])[0])   # status dos cookies deste usuario
+            has_file = os.path.exists(cpath)
             count = 0
             has_session = False
             if has_file:
                 try:
-                    with open(COOKIES, 'r', encoding='utf-8', errors='replace') as f:
+                    with open(cpath, 'r', encoding='utf-8', errors='replace') as f:
                         content = f.read()
                     count = sum(1 for l in content.splitlines() if l.strip() and not l.startswith('#'))
                     has_session = 'sessionid' in content
@@ -609,7 +625,7 @@ class H(BaseHTTPRequestHandler):
             safe = fname.replace('"', '')
             self.send_response(200); self._cors()
             self.send_header('Content-Type', 'application/octet-stream')
-            self.send_header('Content-Disposition', f'attachment; filename="{safe}"')
+            self.send_header('Content-Disposition', _cd(safe))
             self.send_header('Content-Length', str(size)); self.end_headers()
             with open(path, 'rb') as f:
                 while True:
@@ -639,6 +655,8 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path.startswith('/cookie-save'):
+            qs   = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            dest = _cookie_path((qs.get('u') or [''])[0])   # cookies isolados por usuario
             ln = int(self.headers.get('Content-Length', 0))
             if ln > 10 * 1024 * 1024:
                 self._err(413, 'Arquivo muito grande.'); return
@@ -648,10 +666,10 @@ class H(BaseHTTPRequestHandler):
                 b = json.dumps({'ok': False, 'msg': 'Cookie sessionid não encontrado — verifique se você está logado no Instagram ao exportar.'}).encode('utf-8')
             else:
                 try:
-                    os.makedirs(os.path.dirname(COOKIES), exist_ok=True)
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
                 except Exception:
                     pass
-                with open(COOKIES, 'wb') as f:
+                with open(dest, 'wb') as f:
                     f.write(data)
                 count = sum(1 for l in text.splitlines() if l.strip() and not l.startswith('#'))
                 b = json.dumps({'ok': True, 'count': count}).encode('utf-8')
@@ -677,6 +695,7 @@ class H(BaseHTTPRequestHandler):
         if mode not in ('av', 'video_only', 'audio_only', 'separate_zip'):
             mode = 'av'
         limpar = bool(data.get('clean'))
+        user   = data.get('user')   # chave por usuario -> cookies isolados
 
         self.send_response(200); self._cors()
         self.send_header('Content-Type', 'application/x-ndjson; charset=utf-8')
@@ -711,7 +730,7 @@ class H(BaseHTTPRequestHandler):
                 if has_media:
                     handle_shopify_cloud(normalize_link(link), prods, emit_i, d, job_id, limpar=True)
                 else:
-                    handle_one(link, emit_i, mode=mode, limpar=limpar, job_id=job_id)
+                    handle_one(link, emit_i, mode=mode, limpar=limpar, job_id=job_id, user=user)
             except Exception as ex:   # um link com erro nao derruba o lote inteiro
                 try:
                     emit_i({'type': 'done', 'ok': False, 'msg': str(ex)[:200]})
@@ -811,14 +830,17 @@ class H(BaseHTTPRequestHandler):
         if tmp is None:
             self._err(413, 'Arquivo acima de 300 MB.'); return
         try:
+            ext = os.path.splitext(src)[1].lower()
+            if ext not in IMG_CLEAN and ext not in VID_CLEAN:
+                self._err(415, 'Tipo não suportado (use jpg, png, mp4, mov).'); return
             if not clean_meta(src):
-                self._err(415, 'Tipo não suportado.'); return
-            root, ext = os.path.splitext(os.path.basename(src))
-            outname = root + '_limpo' + ext
+                self._err(500, 'Não consegui limpar este arquivo (pode estar corrompido ou a ferramenta falhou).'); return
+            root, ext2 = os.path.splitext(os.path.basename(src))
+            outname = root + '_limpo' + ext2
             size = os.path.getsize(src)
             self.send_response(200); self._cors()
             self.send_header('Content-Type', 'application/octet-stream')
-            self.send_header('Content-Disposition', f'attachment; filename="{outname}"')
+            self.send_header('Content-Disposition', _cd(outname))
             self.send_header('Content-Length', str(size)); self.end_headers()
             with open(src, 'rb') as f:
                 while True:
@@ -839,7 +861,7 @@ class H(BaseHTTPRequestHandler):
             data = {}
             try:
                 r = subprocess.run(['exiftool', '-json', '-G1', '-a', '-u', src],
-                                   capture_output=True, text=True)
+                                   capture_output=True, text=True, timeout=120)
                 arr = json.loads(r.stdout) if r.stdout.strip() else []
                 data = arr[0] if arr else {}
             except Exception:
