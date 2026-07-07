@@ -479,6 +479,10 @@ def handle_shopify_cloud(link, produtos, emit, job_dir, job_id, limpar=True):
 
 def handle_one(link, emit, mode='av', limpar=False, job_id=None, user=None):
     link = normalize_link(link)
+    if not _shop_url_ok(link):   # bloqueia SSRF: link para IP interno/loopback/metadados
+        emit({'type': 'start', 'link': link, 'source': detect_source(link)})
+        emit({'type': 'done', 'ok': False, 'msg': 'Link nao permitido (endereco interno ou invalido).'})
+        return
     src  = detect_source(link)
     clean_link = link.split('?')[0] if src == 'Instagram' else link
     emit({'type': 'start', 'link': link, 'source': src})
