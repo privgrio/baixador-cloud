@@ -9,6 +9,7 @@ import limpa_midia
 PORT = int(os.environ.get('PORT', '10000'))
 MAX_UPLOAD = 300 * 1024 * 1024   # 300 MB para /clean e /meta
 JOB_TTL    = 600                  # 10 min para baixar os arquivos do job
+CONVERT_TIMEOUT = 100            # seg: teto da conversao HEVC->H.264 (nunca trava pra sempre)
 
 # Cookies do Instagram (login). Guarda no disco persistente do Render (/var/data)
 # se existir, para sobreviver a restart/deploy; senao usa pasta temporaria.
@@ -167,22 +168,38 @@ def _curl_run(link, out_dir, gif=False, emit=None):
     if emit: emit({'type': 'progress', 'percent': 95})
     return p.returncode, ''
 
-def _ensure_quicktime(path, emit):
+def _ensure_quicktime(path, emit, do_convert=True):
+    """Garante H.264 (compatibilidade com editores/desktop). No CELULAR
+    (do_convert=False) NAO converte: iPhone/Android postam HEVC nativo e a
+    conversao era justamente o passo lento que travava a tela no telefone.
+    Nunca bloqueia pra sempre: usa preset rapido e timeout; se estourar, fica
+    com o arquivo original (melhor um HEVC pronto do que travar)."""
     try:
+        if not do_convert:
+            return
         r = subprocess.run(
             ['ffprobe', '-v', 'quiet', '-select_streams', 'v:0',
              '-show_entries', 'stream=codec_name', '-of', 'default=nk=1:nw=1', path],
             capture_output=True, text=True)
         vcodec = r.stdout.strip()
-        if vcodec == 'h264':
+        if not vcodec or vcodec == 'h264':
             return
         emit({'type': 'status', 'text': f'convertendo {vcodec}→H.264...'})
         tmp = path + '.qt.mp4'
-        subprocess.run(['ffmpeg', '-y', '-i', path,
-                        '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
-                        '-c:a', 'aac', '-movflags', '+faststart', tmp],
-                       capture_output=True)
-        os.replace(tmp, path)
+        try:
+            subprocess.run(['ffmpeg', '-y', '-i', path,
+                            '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
+                            '-c:a', 'aac', '-movflags', '+faststart', tmp],
+                           capture_output=True, timeout=CONVERT_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            try: os.remove(tmp)
+            except Exception: pass
+            return
+        if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+            os.replace(tmp, path)
+        else:
+            try: os.remove(tmp)
+            except Exception: pass
     except Exception:
         pass
 
@@ -477,7 +494,7 @@ def handle_shopify_cloud(link, produtos, emit, job_dir, job_id, limpar=True):
         shutil.rmtree(work, ignore_errors=True)
 
 
-def handle_one(link, emit, mode='av', limpar=False, job_id=None, user=None):
+def handle_one(link, emit, mode='av', limpar=False, job_id=None, user=None, do_convert=True):
     link = normalize_link(link)
     if not _shop_url_ok(link):   # bloqueia SSRF: link para IP interno/loopback/metadados
         emit({'type': 'start', 'link': link, 'source': detect_source(link)})
@@ -506,7 +523,7 @@ def handle_one(link, emit, mode='av', limpar=False, job_id=None, user=None):
                 rc, err = _ytdlp_run(VIDEO_AV, clean_link, tmp, '%(autonumber)d.%(ext)s', emit, user)
             for f in os.listdir(tmp):
                 if f.endswith('.mp4'):
-                    _ensure_quicktime(os.path.join(tmp, f), emit)
+                    _ensure_quicktime(os.path.join(tmp, f), emit, do_convert)
         else:
             emit({'type': 'kind', 'kind': 'Vídeo + áudio (MP4)'})
             if mode == 'audio_only':
@@ -518,7 +535,7 @@ def handle_one(link, emit, mode='av', limpar=False, job_id=None, user=None):
                 if rc == 0:
                     for f in os.listdir(tmp):
                         if f.endswith('.mp4'):
-                            _ensure_quicktime(os.path.join(tmp, f), emit)
+                            _ensure_quicktime(os.path.join(tmp, f), emit, do_convert)
                 if rc != 0 and not collect(tmp):
                     emit({'type': 'kind', 'kind': 'Imagem'})
                     _gallery_run(clean_link, tmp, emit, user)
@@ -700,6 +717,9 @@ class H(BaseHTTPRequestHandler):
             mode = 'av'
         limpar = bool(data.get('clean'))
         user   = data.get('user')   # chave por usuario -> cookies isolados
+        # convert=False (celular): NAO reencoda HEVC->H.264. iPhone/Android postam
+        # HEVC nativo, e a conversao era o passo lento que travava no telefone.
+        do_convert = bool(data.get('convert', True))
 
         self.send_response(200); self._cors()
         self.send_header('Content-Type', 'application/x-ndjson; charset=utf-8')
@@ -724,6 +744,16 @@ class H(BaseHTTPRequestHandler):
             _jobs[job_id] = {'dir': d, 'files': [], 'expires': time.time() + JOB_TTL}
 
         emit({'type': 'init', 'total': len(links)})
+
+        # Batimento: manda um ping a cada 4s pra manter a conexao viva durante
+        # passos silenciosos (conversao, limpar metadados, gallery-dl). Sem isso o
+        # iOS/operadora derruba a conexao no silencio e a tela trava pra sempre.
+        _hb_stop = threading.Event()
+        def _heartbeat():
+            while not _hb_stop.wait(4):
+                emit({'type': 'ping'})
+        threading.Thread(target=_heartbeat, daemon=True).start()
+
         for i, link in enumerate(links):
             emit_i = lambda o, i=i: emit(o, i)
             try:
@@ -734,12 +764,13 @@ class H(BaseHTTPRequestHandler):
                 if has_media:
                     handle_shopify_cloud(normalize_link(link), prods, emit_i, d, job_id, limpar=True)
                 else:
-                    handle_one(link, emit_i, mode=mode, limpar=limpar, job_id=job_id, user=user)
+                    handle_one(link, emit_i, mode=mode, limpar=limpar, job_id=job_id, user=user, do_convert=do_convert)
             except Exception as ex:   # um link com erro nao derruba o lote inteiro
                 try:
                     emit_i({'type': 'done', 'ok': False, 'msg': str(ex)[:200]})
                 except Exception:
                     pass
+        _hb_stop.set()   # desliga o batimento
         emit({'type': 'all_done'})
 
     def _produto(self):
