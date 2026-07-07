@@ -596,6 +596,39 @@ class H(BaseHTTPRequestHandler):
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.send_header('Content-Length', str(len(b))); self.end_headers(); self.wfile.write(b)
 
+    def _grab(self):
+        """Baixa 1 video (TikTok/IG/etc) e devolve o MP4 direto, sem marca d'agua e
+        SEM conversao (leve). Feito pro Atalho da Apple salvar no rolo com 1 toque:
+        GET /grab?url=<link>  ->  bytes do video (Content-Type video/mp4)."""
+        qs   = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        raw  = (qs.get('url') or [''])[0]
+        link = normalize_link(raw) if raw else ''
+        if not link or not _shop_url_ok(link) or detect_source(link) == 'Web':
+            self._err(400, 'link invalido'); return
+        tmp = tempfile.mkdtemp()
+        try:
+            _ytdlp_run(VIDEO_AV, link, tmp, '%(id)s.%(ext)s', lambda o: None)
+            vids = [f for f in collect(tmp)
+                    if f.lower().rsplit('.', 1)[-1] in ('mp4', 'mov', 'webm', 'mkv')]
+            if not vids:
+                self._err(502, 'nao consegui baixar esse link'); return
+            path = vids[0]
+            size = os.path.getsize(path)
+            self.send_response(200); self._cors()
+            self.send_header('Content-Type', 'video/mp4')
+            self.send_header('Content-Disposition', 'inline; filename="video.mp4"')
+            self.send_header('Content-Length', str(size)); self.end_headers()
+            with open(path, 'rb') as f:
+                while True:
+                    c = f.read(1 << 20)
+                    if not c: break
+                    self.wfile.write(c)
+        except Exception as e:
+            try: self._err(500, str(e)[:150])
+            except Exception: pass
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def do_GET(self):
         if self.path.startswith('/ping'):
             b = b'{"ok":true,"cloud":true}'
@@ -603,6 +636,9 @@ class H(BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(b))); self.end_headers(); self.wfile.write(b)
             return
+
+        if self.path.startswith('/grab'):
+            self._grab(); return
 
         if self.path.startswith('/bookmarklet'):
             # pagina que instala o "botao magico" (bookmarklet)
