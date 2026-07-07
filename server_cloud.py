@@ -10,6 +10,9 @@ PORT = int(os.environ.get('PORT', '10000'))
 MAX_UPLOAD = 300 * 1024 * 1024   # 300 MB para /clean e /meta
 JOB_TTL    = 600                  # 10 min para baixar os arquivos do job
 CONVERT_TIMEOUT = 100            # seg: teto da conversao HEVC->H.264 (nunca trava pra sempre)
+# 1 conversao por vez: a instancia do Render tem pouca memoria e varias conversoes
+# 1080p ao mesmo tempo estouravam o limite (OOM -> restart automatico).
+_CONVERT_SEM = threading.Semaphore(1)
 
 # Cookies do Instagram (login). Guarda no disco persistente do Render (/var/data)
 # se existir, para sobreviver a restart/deploy; senao usa pasta temporaria.
@@ -184,17 +187,20 @@ def _ensure_quicktime(path, emit, do_convert=True):
         vcodec = r.stdout.strip()
         if not vcodec or vcodec == 'h264':
             return
-        emit({'type': 'status', 'text': f'convertendo {vcodec}→H.264...'})
         tmp = path + '.qt.mp4'
-        try:
-            subprocess.run(['ffmpeg', '-y', '-i', path,
-                            '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
-                            '-c:a', 'aac', '-movflags', '+faststart', tmp],
-                           capture_output=True, timeout=CONVERT_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            try: os.remove(tmp)
-            except Exception: pass
-            return
+        # Semaforo: 1 conversao por vez (bounda a memoria). O batimento do /download
+        # mantem a conexao viva enquanto espera a vez. -threads 2 segura a RAM do ffmpeg.
+        with _CONVERT_SEM:
+            emit({'type': 'status', 'text': f'convertendo {vcodec}→H.264...'})
+            try:
+                subprocess.run(['ffmpeg', '-y', '-i', path,
+                                '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
+                                '-threads', '2', '-c:a', 'aac', '-movflags', '+faststart', tmp],
+                               capture_output=True, timeout=CONVERT_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                try: os.remove(tmp)
+                except Exception: pass
+                return
         if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
             os.replace(tmp, path)
         else:
