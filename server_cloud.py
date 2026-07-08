@@ -209,6 +209,33 @@ def _ensure_quicktime(path, emit, do_convert=True):
     except Exception:
         pass
 
+def _tikwm_video(link, out_dir, emit=None):
+    """Fallback p/ TikTok: as vezes o yt-dlp so acha a faixa de audio (m4a) por
+    causa da protecao anti-robo do TikTok. Aqui pega o MP4 sem marca d'agua pela
+    API publica do tikwm. Devolve True se salvou um video."""
+    try:
+        if emit: emit({'type': 'status', 'text': 'pegando o vídeo (via tikwm)...'})
+        api = 'https://tikwm.com/api/?hd=1&url=' + urllib.parse.quote(link, safe='')
+        req = urllib.request.Request(api, headers={'User-Agent': SHOP_UA})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read(4 * 1024 * 1024))
+        d = (data or {}).get('data') or {}
+        play = d.get('hdplay') or d.get('play') or d.get('wmplay')
+        if not play:
+            return False
+        if play.startswith('/'):
+            play = 'https://tikwm.com' + play
+        if not _shop_url_ok(play):   # nao segue URL para host interno (SSRF)
+            return False
+        out = os.path.join(out_dir, '1.mp4')
+        vreq = urllib.request.Request(play, headers={'User-Agent': SHOP_UA,
+                                                     'Referer': 'https://tikwm.com/'})
+        with urllib.request.urlopen(vreq, timeout=90) as vr, open(out, 'wb') as f:
+            shutil.copyfileobj(vr, f)
+        return os.path.getsize(out) > 0
+    except Exception:
+        return False
+
 # ============================================================================
 # SHOPIFY: cola link de produto/colecao -> baixa TODAS as fotos (e videos) por
 # produto e entrega um ZIP (pasta por produto dentro). Funciona em qualquer loja.
@@ -538,10 +565,17 @@ def handle_one(link, emit, mode='av', limpar=False, job_id=None, user=None, do_c
                                      clean_link, tmp, '%(autonumber)d.%(ext)s', emit, user)
             else:
                 rc, err = _ytdlp_run(VIDEO_AV, clean_link, tmp, '%(autonumber)d.%(ext)s', emit, user)
-                if rc == 0:
-                    for f in os.listdir(tmp):
-                        if f.endswith('.mp4'):
-                            _ensure_quicktime(os.path.join(tmp, f), emit, do_convert)
+                # TikTok as vezes so traz a faixa de audio pelo yt-dlp (anti-robo):
+                # cai pro tikwm p/ pegar o MP4 de verdade.
+                if src == 'TikTok' and not any(f.lower().endswith(('.mp4', '.mov')) for f in os.listdir(tmp)):
+                    if _tikwm_video(clean_link, tmp, emit):
+                        for f in os.listdir(tmp):   # entrega so o video, sem o audio solto
+                            if f.lower().endswith(('.m4a', '.mp3')):
+                                try: os.remove(os.path.join(tmp, f))
+                                except Exception: pass
+                for f in os.listdir(tmp):
+                    if f.endswith('.mp4'):
+                        _ensure_quicktime(os.path.join(tmp, f), emit, do_convert)
                 if rc != 0 and not collect(tmp):
                     emit({'type': 'kind', 'kind': 'Imagem'})
                     _gallery_run(clean_link, tmp, emit, user)
@@ -610,6 +644,10 @@ class H(BaseHTTPRequestHandler):
             _ytdlp_run(VIDEO_AV, link, tmp, '%(id)s.%(ext)s', lambda o: None)
             vids = [f for f in collect(tmp)
                     if f.lower().rsplit('.', 1)[-1] in ('mp4', 'mov', 'webm', 'mkv')]
+            if not vids and detect_source(link) == 'TikTok':   # yt-dlp so trouxe audio -> tikwm
+                _tikwm_video(link, tmp)
+                vids = [f for f in collect(tmp)
+                        if f.lower().rsplit('.', 1)[-1] in ('mp4', 'mov', 'webm', 'mkv')]
             if not vids:
                 self._err(502, 'nao consegui baixar esse link'); return
             path = vids[0]
