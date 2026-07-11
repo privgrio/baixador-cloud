@@ -19,6 +19,20 @@ _CONVERT_SEM = threading.Semaphore(1)
 COOKIE_DIR = '/var/data' if os.path.isdir('/var/data') else tempfile.gettempdir()
 COOKIES    = os.path.join(COOKIE_DIR, 'cookies.txt')
 
+def _ytdlp_version():
+    """Versao do yt-dlp instalado (uma vez, cacheado). So pra diagnostico no /ping."""
+    global _YTDLP_VER
+    try:
+        return _YTDLP_VER
+    except NameError:
+        pass
+    try:
+        _YTDLP_VER = subprocess.run(['yt-dlp', '--version'], capture_output=True,
+                                    text=True, timeout=15).stdout.strip() or '?'
+    except Exception:
+        _YTDLP_VER = '?'
+    return _YTDLP_VER
+
 def _cookie_path(user):
     """Arquivo de cookies ISOLADO por usuario (chave imprevisivel vinda do front).
     Sem chave, cai no arquivo legado compartilhado (compatibilidade)."""
@@ -669,7 +683,8 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.startswith('/ping'):
-            b = b'{"ok":true,"cloud":true}'
+            b = json.dumps({'ok': True, 'cloud': True,
+                            'ytdlp': _ytdlp_version()}).encode('utf-8')
             self.send_response(200); self._cors()
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(b))); self.end_headers(); self.wfile.write(b)
