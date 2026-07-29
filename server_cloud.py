@@ -5,6 +5,13 @@ import os, re, json, shutil, tempfile, subprocess, urllib.parse, urllib.request,
 import concurrent.futures
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import limpa_midia
+# Exportador de Sites (rotas /export/*). Fica num modulo separado de proposito:
+# se ele quebrar, o Baixador continua funcionando normalmente.
+try:
+    import exportador_cloud
+except Exception as _e:
+    exportador_cloud = None
+    print('Exportador indisponivel:', _e)
 
 PORT = int(os.environ.get('PORT', '10000'))
 MAX_UPLOAD = 300 * 1024 * 1024   # 300 MB para /clean e /meta
@@ -682,6 +689,12 @@ class H(BaseHTTPRequestHandler):
             shutil.rmtree(tmp, ignore_errors=True)
 
     def do_GET(self):
+        if exportador_cloud and self.path.startswith('/export'):
+            try:
+                if exportador_cloud.handle_get(self): return
+            except Exception as e:
+                self._err(500, 'exportador: ' + str(e)[:150]); return
+
         if self.path.startswith('/ping'):
             b = json.dumps({'ok': True, 'cloud': True,
                             'ytdlp': _ytdlp_version()}).encode('utf-8')
@@ -770,6 +783,12 @@ class H(BaseHTTPRequestHandler):
         return tmp, src
 
     def do_POST(self):
+        if exportador_cloud and self.path.startswith('/export'):
+            try:
+                if exportador_cloud.handle_post(self): return
+            except Exception as e:
+                self._err(500, 'exportador: ' + str(e)[:150]); return
+
         if self.path.startswith('/cookie-save'):
             qs   = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             dest = _cookie_path((qs.get('u') or [''])[0])   # cookies isolados por usuario
@@ -1034,5 +1053,7 @@ class H(BaseHTTPRequestHandler):
 
 
 if __name__ == '__main__':
+    if exportador_cloud:
+        exportador_cloud.start_background()   # faxina das exportacoes velhas
     print(f'Motor de nuvem rodando na porta {PORT}')
     ThreadingHTTPServer(('0.0.0.0', PORT), H).serve_forever()
