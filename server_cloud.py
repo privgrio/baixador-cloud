@@ -230,6 +230,50 @@ def _ensure_quicktime(path, emit, do_convert=True):
     except Exception:
         pass
 
+VIDEO_EXT_MODO = ('.mp4', '.mov', '.m4v', '.webm')
+
+
+def _aplicar_modo_video(tmp, mode, emit):
+    """No Instagram os arquivos chegam prontos do gallery-dl, com o audio junto.
+    Se o usuario escolheu 'So video, sem audio' ou 'Video e audio separados', o
+    corte precisa ser feito aqui: sem isto a escolha era ignorada em silencio e
+    ia video COM audio do mesmo jeito. Num carrossel vale pra cada video."""
+    if mode not in ('video_only', 'separate_zip'):
+        return
+    videos = [f for f in collect(tmp) if f.lower().endswith(VIDEO_EXT_MODO)]
+    if not videos:
+        return
+    emit({'type': 'status',
+          'text': 'removendo o audio...' if mode == 'video_only'
+                  else 'separando video e audio...'})
+    for i, src in enumerate(sorted(videos), 1):
+        if mode == 'video_only':
+            saidas = [(os.path.join(tmp, f'{i:02d}-video.mp4'),
+                       ['-an', '-c:v', 'copy'])]
+        else:
+            # numero do item primeiro, e 1-/2- pro video ficar antes do audio
+            saidas = [(os.path.join(tmp, f'{i:02d}-1-video.mp4'), ['-an', '-c:v', 'copy']),
+                      (os.path.join(tmp, f'{i:02d}-2-audio.mp3'),
+                       ['-vn', '-c:a', 'libmp3lame', '-q:a', '0'])]
+        feitos = 0
+        for destino, args in saidas:
+            try:
+                subprocess.run(['ffmpeg', '-y', '-i', src] + args + [destino],
+                               capture_output=True, timeout=CONVERT_TIMEOUT)
+                if os.path.exists(destino) and os.path.getsize(destino) > 0:
+                    feitos += 1
+            except Exception:
+                pass
+        if feitos == len(saidas):
+            try: os.remove(src)      # so descarta o original depois de dar certo
+            except Exception: pass
+    # nesses dois modos o usuario quer VIDEO: foto de carrossel nao entra
+    for f in collect(tmp):
+        if not f.lower().endswith(('.mp4', '.mp3')):
+            try: os.remove(f)
+            except Exception: pass
+
+
 def _tikwm_video(link, out_dir, emit=None):
     """Fallback p/ TikTok: as vezes o yt-dlp so acha a faixa de audio (m4a) por
     causa da protecao anti-robo do TikTok. Aqui pega o MP4 sem marca d'agua pela
@@ -570,7 +614,10 @@ def handle_one(link, emit, mode='av', limpar=False, job_id=None, user=None, do_c
             # Carrossel do Instagram (fotos + videos juntos): o gallery-dl pega
             # TODOS os itens do post. O yt-dlp sozinho so traz o video e ignora as
             # fotos, por isso aqui ele e so o plano B (ex.: reel de video puro).
-            emit({'type': 'kind', 'kind': 'Instagram (carrossel)'})
+            emit({'type': 'kind', 'kind': {
+                'video_only':   'Só vídeo, sem áudio (MP4)',
+                'separate_zip': 'Vídeo e áudio separados (MP4 + MP3)',
+            }.get(mode, 'Instagram (carrossel)')})
             rc, err = _gallery_run(clean_link, tmp, emit, user)
             if not collect(tmp):
                 emit({'type': 'kind', 'kind': 'Vídeo + áudio (MP4)'})
@@ -578,6 +625,7 @@ def handle_one(link, emit, mode='av', limpar=False, job_id=None, user=None, do_c
             for f in os.listdir(tmp):
                 if f.endswith('.mp4'):
                     _ensure_quicktime(os.path.join(tmp, f), emit, do_convert)
+            _aplicar_modo_video(tmp, mode, emit)
         else:
             emit({'type': 'kind', 'kind': 'Vídeo + áudio (MP4)'})
             if mode == 'audio_only':
