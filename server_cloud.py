@@ -15,6 +15,8 @@ except Exception as _e:
 
 PORT = int(os.environ.get('PORT', '10000'))
 MAX_UPLOAD = 300 * 1024 * 1024   # 300 MB para /clean e /meta
+UNIF_PRESET = 'superfast'        # /unificar: maquina fraca aqui (0,5 CPU), prioriza velocidade
+MAX_UNIFICAR = 150 * 1024 * 1024  # teto do /unificar aqui na nuvem (recodifica, e caro)
 JOB_TTL    = 600                  # 10 min para baixar os arquivos do job
 CONVERT_TIMEOUT = 100            # seg: teto da conversao HEVC->H.264 (nunca trava pra sempre)
 # 1 conversao por vez: a instancia do Render tem pouca memoria e varias conversoes
@@ -687,7 +689,7 @@ class H(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.send_header('Access-Control-Allow-Private-Network', 'true')
-        self.send_header('Access-Control-Expose-Headers', 'Content-Disposition')
+        self.send_header('Access-Control-Expose-Headers', 'Content-Disposition, X-Unificar-Info')
 
     def do_OPTIONS(self):
         self.send_response(204); self._cors()
@@ -864,6 +866,8 @@ class H(BaseHTTPRequestHandler):
             self._meta(); return
         if self.path.startswith('/clean'):
             self._clean(); return
+        if self.path.startswith('/unificar'):
+            self._unificar(); return
         if self.path.startswith('/produto'):
             self._produto(); return
         if self.path == '/download':
@@ -1046,6 +1050,84 @@ class H(BaseHTTPRequestHandler):
                     self.wfile.write(c)
         except Exception as e:
             try: self._err(500, str(e)[:200])
+            except Exception: pass
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def _unificar(self):
+        # Gera N versoes UNICAS do arquivo. Aqui na nuvem a maquina e fraca (0,5 CPU),
+        # entao usa preset mais rapido e limita a 3 versoes; no motor do computador
+        # do usuario o mesmo endpoint roda com qualidade melhor e ate 10 versoes.
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        def _q(k, padrao=''):
+            return (qs.get(k) or [padrao])[0]
+        nivel = _q('nivel', 'medio')
+        if nivel not in limpa_midia.NIVEIS:
+            nivel = 'medio'
+        try:
+            versoes = max(1, min(3, int(_q('versoes', '1'))))
+        except Exception:
+            versoes = 1
+        repetidos = _q('repetidos') in ('1', 'true', 'sim')
+        espelhar = _q('espelhar') in ('1', 'true', 'sim')
+        # Unificar RECODIFICA o video inteiro, ao contrario do /clean (que so copia os
+        # fluxos). Nesta maquina isso e ~2x mais lento que o tempo do proprio video,
+        # entao um arquivo enorme ficaria minutos pendurado e a conexao cairia antes.
+        # Melhor recusar com mensagem clara e mandar o usuario ligar o motor do PC.
+        try:
+            if int(self.headers.get('Content-Length', 0)) > MAX_UNIFICAR:
+                self._err(413, 'Pela nuvem o teto para unificar é 150 MB (unificar recodifica o vídeo '
+                               'inteiro e aqui a máquina é fraca). Para arquivos maiores, ligue o motor '
+                               'no computador pelo Baixador.command.')
+                return
+        except Exception:
+            pass
+        tmp, src = self._recv()
+        if tmp is None:
+            self._err(413, 'Arquivo acima de 300 MB.'); return
+        try:
+            base = os.path.basename(src)
+            root, ext = os.path.splitext(base)
+            ext_l = ext.lower()
+            if ext_l not in IMG_CLEAN and ext_l not in VID_CLEAN:
+                self._err(415, 'Tipo não suportado (use jpg, png, mp4, mov).'); return
+            ext_saida = ext_l if ext_l in ('.mp4', '.mov', '.m4v', '.jpg', '.jpeg', '.png') else \
+                        ('.mp4' if limpa_midia.detectar_tipo(src) == 'video' else '.jpg')
+            feitos, relatorios = [], []
+            for n in range(1, versoes + 1):
+                nome = f'{root}_v{n}{ext_saida}'
+                destino = os.path.join(tmp, nome)
+                rel = limpa_midia.unificar(src, destino, nivel=nivel, preset=UNIF_PRESET,
+                                           tirar_repetidos=repetidos, espelhar=espelhar)
+                feitos.append((nome, destino))
+                relatorios.append({'versao': n, 'sha': rel['sha256_depois'][:12],
+                                   'mb': round(rel['bytes_depois'] / 1048576, 2),
+                                   'velocidade': rel.get('velocidade'),
+                                   'corte': rel.get('corte_bordas_pct')})
+            info = json.dumps({'nivel': nivel, 'versoes': relatorios}, ensure_ascii=True)
+            if len(feitos) == 1:
+                nome, caminho = feitos[0]
+                tipo = 'application/octet-stream'
+            else:
+                caminho = os.path.join(tmp, f'{root}_unificado.zip')
+                nome = f'{root}_unificado.zip'
+                tipo = 'application/zip'
+                with zipfile.ZipFile(caminho, 'w', zipfile.ZIP_STORED) as zf:
+                    for n2, c2 in feitos:
+                        zf.write(c2, n2)
+            size = os.path.getsize(caminho)
+            self.send_response(200); self._cors()
+            self.send_header('Content-Type', tipo)
+            self.send_header('Content-Disposition', _cd(nome))
+            self.send_header('X-Unificar-Info', info)
+            self.send_header('Content-Length', str(size)); self.end_headers()
+            with open(caminho, 'rb') as f:
+                while True:
+                    c = f.read(1 << 20)
+                    if not c: break
+                    self.wfile.write(c)
+        except Exception as e:
+            try: self._err(500, str(e)[:300])
             except Exception: pass
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
