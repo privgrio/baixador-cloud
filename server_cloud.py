@@ -17,6 +17,8 @@ PORT = int(os.environ.get('PORT', '10000'))
 MAX_UPLOAD = 300 * 1024 * 1024   # 300 MB para /clean e /meta
 UNIF_PRESET = 'superfast'        # /unificar: maquina fraca aqui (0,5 CPU), prioriza velocidade
 MAX_UNIFICAR = 150 * 1024 * 1024  # teto do /unificar aqui na nuvem (recodifica, e caro)
+UNIF_THREADS = 2                 # segura a MEMORIA do x264 (cada thread guarda um quadro)
+UNIF_MAX_PIXELS = 1080 * 1920    # acima disso reduz na proporcao (4K estoura os 512 MB)
 JOB_TTL    = 600                  # 10 min para baixar os arquivos do job
 CONVERT_TIMEOUT = 100            # seg: teto da conversao HEVC->H.264 (nunca trava pra sempre)
 # 1 conversao por vez: a instancia do Render tem pouca memoria e varias conversoes
@@ -1097,8 +1099,13 @@ class H(BaseHTTPRequestHandler):
             for n in range(1, versoes + 1):
                 nome = f'{root}_v{n}{ext_saida}'
                 destino = os.path.join(tmp, nome)
-                rel = limpa_midia.unificar(src, destino, nivel=nivel, preset=UNIF_PRESET,
-                                           tirar_repetidos=repetidos, espelhar=espelhar)
+                # Uma conversao por vez e com poucas threads: esta instancia tem 512 MB
+                # e enxerga os nucleos do servidor fisico, entao o ffmpeg no padrao
+                # abre threads demais e estoura a memoria (derruba o motor inteiro).
+                with _CONVERT_SEM:
+                    rel = limpa_midia.unificar(src, destino, nivel=nivel, preset=UNIF_PRESET,
+                                               tirar_repetidos=repetidos, espelhar=espelhar,
+                                               threads=UNIF_THREADS, max_pixels=UNIF_MAX_PIXELS)
                 feitos.append((nome, destino))
                 relatorios.append({'versao': n, 'sha': rel['sha256_depois'][:12],
                                    'mb': round(rel['bytes_depois'] / 1048576, 2),

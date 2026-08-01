@@ -243,7 +243,7 @@ def sondar(src: str | Path) -> dict:
     except Exception:
         data = {}
     info = {"largura": 0, "altura": 0, "fps": 30.0, "tem_audio": False,
-            "taxa_audio": 44100, "duracao": 0.0, "quadros": 0}
+            "taxa_audio": 44100, "duracao": 0.0, "quadros": 0, "bitrate": 0}
     for s in data.get("streams", []):
         if s.get("codec_type") == "video" and not info["largura"]:
             info["largura"] = int(s.get("width") or 0)
@@ -265,10 +265,20 @@ def sondar(src: str | Path) -> dict:
                 info["taxa_audio"] = int(s.get("sample_rate") or 44100)
             except Exception:
                 pass
+    fmt = data.get("format") or {}
     try:
-        info["duracao"] = float((data.get("format") or {}).get("duration") or 0)
+        info["duracao"] = float(fmt.get("duration") or 0)
     except Exception:
         pass
+    try:
+        info["bitrate"] = int(fmt.get("bit_rate") or 0)
+    except Exception:
+        pass
+    if not info["bitrate"] and info["duracao"] > 0:
+        try:
+            info["bitrate"] = int(Path(src).stat().st_size * 8 / info["duracao"])
+        except Exception:
+            pass
     if not info["fps"] or info["fps"] <= 0 or info["fps"] > 240:
         info["fps"] = 30.0
     return info
@@ -351,9 +361,21 @@ def unificar_video(
     preset: str = "veryfast",
     tirar_repetidos: bool = False,
     espelhar: bool = False,
+    threads: int = 0,
+    max_pixels: int = 0,
 ) -> dict:
     """
     Reescreve o vídeo inteiro para que ele seja um arquivo novo.
+
+    threads: 0 = livre (máquina do usuário). Um número pequeno segura o consumo de
+        MEMÓRIA, não só de processador: o x264 guarda uma cópia do quadro por
+        thread e, num container de 512 MB que enxerga os 16 núcleos do servidor
+        físico, o padrão do ffmpeg abre ~24 threads e estoura a memória (foi
+        exatamente isso que derrubou o motor da nuvem na primeira publicação).
+        Com threads pequeno também ligamos fatiamento por faixa (sliced-threads),
+        que divide o MESMO quadro entre as threads em vez de manter vários.
+    max_pixels: 0 = mantém o tamanho original. Se vier acima disso, reduz na
+        proporção (protege a memória em máquina pequena com vídeo 4K).
 
     tirar_repetidos: joga fora quadros idênticos ao anterior (mpdecimate). Bom em
         gravação de tela / animação; em vídeo filmado pode deixar o movimento
@@ -373,6 +395,11 @@ def unificar_video(
     L, A = info["largura"], info["altura"]
     if L <= 0 or A <= 0:
         raise RuntimeError("Não consegui ler a imagem deste vídeo (arquivo corrompido?).")
+    reduzido = False
+    if max_pixels and L * A > max_pixels:
+        fator = (max_pixels / float(L * A)) ** 0.5
+        L, A = int(L * fator), int(A * fator)
+        reduzido = True
     L -= L % 2
     A -= A % 2
 
@@ -425,6 +452,17 @@ def unificar_video(
         cmd += ["-af", f"atempo={vel:.6f}"]
     cmd += ["-c:v", "libx264", "-crf", str(r["crf"]), "-preset", preset,
             "-pix_fmt", "yuv420p", "-g", str(r["gop"])]
+    if threads and threads > 0:
+        cmd += ["-threads", str(threads), "-x264-params", "sliced-threads=1"]
+    # TETO DE TAMANHO. Recomprimir para H.264 um vídeo que veio em HEVC (celular,
+    # TikTok, Instagram) infla o arquivo várias vezes, porque o H.264 precisa de
+    # mais bits para a mesma imagem. Sem teto, um vídeo grande vira um monstro na
+    # hora de subir. O teto é 3x a taxa do original (nunca abaixo de 3 Mbps, nunca
+    # acima de 16 Mbps): o CRF continua mandando na qualidade e o teto só corta o
+    # exagero nas cenas de muito movimento.
+    if info["bitrate"] > 0:
+        teto = int(min(max(info["bitrate"] * 3, 3_000_000), 16_000_000))
+        cmd += ["-maxrate", str(teto), "-bufsize", str(teto * 2)]
     # Com mpdecimate ligado NÃO forçamos taxa fixa: forçar reporia os quadros
     # jogados fora (e, com áudio, seria justamente o que desalinha).
     if not tirar_repetidos:
@@ -451,6 +489,9 @@ def unificar_video(
         "corte_bordas_pct": round(r["corte"] * 100, 2),
         "quadros_repetidos_removidos": bool(tirar_repetidos),
         "espelhado": bool(espelhar),
+        "reduzido": reduzido,
+        "largura_saida": L,
+        "altura_saida": A,
         "duracao_antes": round(info["duracao"], 3),
         "duracao_depois": round(depois["duracao"], 3),
         "fps_antes": round(info["fps"], 3),
@@ -538,7 +579,9 @@ def unificar(src: str | Path, dst: str | Path | None = None, **kw) -> dict:
         rel = unificar_video(src, dst, nivel=kw.get("nivel", "medio"),
                              semente=kw.get("semente"), preset=kw.get("preset", "veryfast"),
                              tirar_repetidos=kw.get("tirar_repetidos", False),
-                             espelhar=kw.get("espelhar", False))
+                             espelhar=kw.get("espelhar", False),
+                             threads=kw.get("threads", 0),
+                             max_pixels=kw.get("max_pixels", 0))
     rel.update({
         "entrada": str(src),
         "saida": str(dst),
